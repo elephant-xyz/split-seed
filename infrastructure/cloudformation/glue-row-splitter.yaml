@@ -1,0 +1,140 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Glue PySpark job that splits a CSV into one-file-per-row, named by a source_identifier column.
+
+Parameters:
+  JobName:
+    Type: String
+    Default: glue-row-splitter
+    Description: Name of the AWS Glue Job
+  ScriptS3Key:
+    Type: String
+    Description: S3 key for the Glue job script
+    Default: glue/scripts/split_csv_rows.py
+  WorkerType:
+    Type: String
+    Default: G.1X
+    AllowedValues: [G.025X, G.1X, G.2X, G.4X, G.8X, G.12X, G.16X]
+    Description: Worker type for PySpark jobs
+  NumberOfWorkers:
+    Type: Number
+    Default: 2
+    MinValue: 2
+    Description: Number of workers for PySpark jobs
+  GlueVersion:
+    Type: String
+    Default: "4.0"
+    AllowedValues: ["3.0", "4.0", "5.0"]
+    Description: AWS Glue version (determines Spark and Python versions)
+  EnableSparkUI:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Enable Spark UI for job monitoring and debugging
+
+Resources:
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  SparkUILogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${JobName}-spark-ui-logs-${AWS::AccountId}-${AWS::Region}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteSparkUILogsAfter30Days
+            Status: Enabled
+            ExpirationInDays: 30
+
+  GlueJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${JobName}-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: s3-access-for-glue-splitter
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: BroadS3Access
+                Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:AbortMultipartUpload
+                  - s3:ListBucket
+                  - s3:GetBucketLocation
+                  - s3:DeleteObject
+                Resource:
+                  - arn:aws:s3:::*
+                  - arn:aws:s3:::*/*
+              - Sid: CloudWatchLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  GlueRowSplitterJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Ref JobName
+      Role: !GetAtt GlueJobRole.Arn
+      JobRunQueuingEnabled: true
+      ExecutionProperty:
+        MaxConcurrentRuns: 20
+      Command:
+        Name: glueetl
+        ScriptLocation: !Sub s3://${ArtifactsBucket}/${ScriptS3Key}
+      DefaultArguments:
+        --enable-metrics: "true"
+        --enable-continuous-cloudwatch-log: "true"
+        --enable-observability-metrics: "true"
+        --enable-glue-datacatalog: "true"
+        --enable-spark-ui: !Ref EnableSparkUI
+        --spark-event-logs-path: !Sub "s3://${SparkUILogsBucket}/spark-ui-logs/"
+        --conf: "spark.eventLog.rolling.enabled=true --conf spark.eventLog.rolling.maxFileSize=128m"
+      WorkerType: !Ref WorkerType
+      NumberOfWorkers: !Ref NumberOfWorkers
+      GlueVersion: !Ref GlueVersion
+      Timeout: 60
+
+Outputs:
+  GlueJobName:
+    Description: Deployed AWS Glue Job name
+    Value: !Ref GlueRowSplitterJob
+  GlueRoleArn:
+    Description: IAM Role ARN used by the Glue Job
+    Value: !GetAtt GlueJobRole.Arn
+  ArtifactsBucketName:
+    Description: S3 bucket created to store the Glue script artifact
+    Value: !Ref ArtifactsBucket
+  SparkUILogsBucketName:
+    Description: S3 bucket created to store Spark UI event logs
+    Value: !Ref SparkUILogsBucket

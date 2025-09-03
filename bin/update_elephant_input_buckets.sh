@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Updates access policy for all buckets starting with "elephant-input" to allow public read access.
+# - Disables block public access
+# - Sets bucket policy to allow all S3 read operations for everyone
+
+REGION=${AWS_REGION:-${REGION:-us-east-1}}
+
+if ! command -v aws >/dev/null 2>&1; then
+  echo "aws CLI not found. Please install and configure AWS CLI." >&2
+  exit 1
+fi
+
+echo "Listing all buckets in the account..."
+buckets=$(aws s3api list-buckets --query 'Buckets[].Name' --output text)
+
+for bucket in $buckets; do
+  if [[ $bucket == elephant-input* ]]; then
+    echo "Updating bucket: s3://${bucket} in ${REGION}"
+    
+    echo "Disabling block public access for ${bucket}"
+    aws s3api put-public-access-block --bucket "${bucket}" --region "${REGION}" \
+      --public-access-block-configuration BlockPublicAcls=false,IgnorePublicAcls=false,BlockPublicPolicy=false,RestrictPublicBuckets=false
+    
+    echo "Setting bucket policy to allow all public read operations for ${bucket}"
+    aws s3api put-bucket-policy --bucket "${bucket}" --region "${REGION}" \
+      --policy '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":["s3:Get*","s3:List*"],"Resource":["arn:aws:s3:::'"${bucket}"'","arn:aws:s3:::'"${bucket}"'/*"]}]}'
+    
+    echo "Updated: s3://${bucket}"
+  fi
+done
+
+echo "All elephant-input buckets have been updated."</content>
