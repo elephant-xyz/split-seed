@@ -8,6 +8,7 @@ import re
 import sys
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Tuple
 from types import SimpleNamespace
 
@@ -48,6 +49,15 @@ def safe_filename(name: str) -> str:
 
 def str2bool(value: str) -> bool:
     return str(value).lower() in {"1", "true", "t", "yes", "y"}
+
+
+def upload_file_to_s3(s3_client, bucket, key, data):
+    """Upload a single file to S3. Used by ThreadPoolExecutor."""
+    try:
+        s3_client.put_object(Bucket=bucket, Key=key, Body=data, ContentType="text/csv")
+        return {"success": True, "key": key}
+    except Exception as e:
+        return {"success": False, "key": key, "error": str(e)}
 
 
 def main():
@@ -181,14 +191,23 @@ def main():
         logger.info("Input object size: %s bytes", size)
         body = resp["Body"]
 
-        # Use TextIOWrapper to stream decode bytes to text
-        text_stream = io.TextIOWrapper(body, encoding=args_ns.encoding)
+        # Read entire body to prevent IncompleteReadError on large files
+        logger.info("Reading entire S3 object into memory...")
+        raw_data = body.read()
+        logger.info("Successfully read %d bytes", len(raw_data))
+        text_data = raw_data.decode(args_ns.encoding)
+
+        text_stream = io.StringIO(text_data)
 
         reader = csv.DictReader(text_stream, delimiter=args_ns.delimiter, quotechar=args_ns.quotechar)
         fieldnames = reader.fieldnames
         logger.info("Detected %d columns: %s", 0 if not fieldnames else len(fieldnames or []), fieldnames)
         if not fieldnames:
             raise RuntimeError("No CSV header/fieldnames detected. Ensure the input has a header row.")
+
+        # Prepare all upload tasks first
+        upload_tasks = []
+        logger.info("Preparing upload tasks...")
 
         for idx, row in enumerate(reader, start=1):
             total += 1
@@ -214,17 +233,52 @@ def main():
 
             data = buf.getvalue().encode(args_ns.encoding)
 
-            s3.put_object(Bucket=output_bucket, Key=out_key, Body=data, ContentType="text/csv")
-            manifest.append(
-                {
+            upload_tasks.append({
+                "key": out_key,
+                "data": data,
+                "manifest_entry": {
                     "s3_uri": f"s3://{output_bucket}/{out_key}",
                     "row_index": idx,
                     "source_identifier": raw_name,
                 }
-            )
+            })
 
-            if idx % 1000 == 0:
-                logger.info("Processed %d rows...", idx)
+            if idx % 10000 == 0:
+                logger.info("Prepared %d rows...", idx)
+
+        logger.info("Prepared %d upload tasks. Starting parallel uploads with 100 workers...", len(upload_tasks))
+
+        # Upload files in parallel using ThreadPoolExecutor
+        upload_start = time.time()
+        failed_uploads = []
+
+        with ThreadPoolExecutor(max_workers=100) as executor:
+            futures = {
+                executor.submit(upload_file_to_s3, s3, output_bucket, task["key"], task["data"]): task
+                for task in upload_tasks
+            }
+
+            completed = 0
+            for future in as_completed(futures):
+                completed += 1
+                task = futures[future]
+                result = future.result()
+
+                if result["success"]:
+                    manifest.append(task["manifest_entry"])
+                else:
+                    failed_uploads.append(result)
+                    logger.error("Failed to upload %s: %s", result["key"], result["error"])
+
+                if completed % 1000 == 0:
+                    logger.info("Uploaded %d/%d files...", completed, len(upload_tasks))
+
+        upload_duration = time.time() - upload_start
+        logger.info("Completed %d uploads in %.2fs (%.0f files/sec)", len(upload_tasks), upload_duration, len(upload_tasks) / upload_duration)
+
+        if failed_uploads:
+            logger.error("Failed to upload %d files", len(failed_uploads))
+            raise RuntimeError(f"Failed to upload {len(failed_uploads)} files")
 
         # Write manifest
         manifest_key = f"{output_prefix}_MANIFEST.json"
