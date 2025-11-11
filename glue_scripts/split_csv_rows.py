@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 logger.addHandler(logging.StreamHandler())
 logger.setLevel(logging.DEBUG)
 
+csv.field_size_limit(sys.maxsize)
 
 def parse_s3_uri(uri: str) -> Tuple[str, str]:
     if not uri.startswith("s3://"):
